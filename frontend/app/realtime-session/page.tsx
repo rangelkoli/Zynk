@@ -9,6 +9,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { createClient } from "@/utils/supabase/client";
 
 export default function WebcamPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -21,6 +22,26 @@ export default function WebcamPage() {
   const [feedbackText, setFeedbackText] = useState(
     "Position yourself in the center"
   );
+  const [userId, setUserId] = useState<string | null>(null);
+  const supabase = createClient();
+
+  // Fetch user ID on component mount
+  useEffect(() => {
+    const fetchUser = async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (user) {
+        setUserId(user.id);
+        console.log("User ID:", user.id);
+      } else {
+        setUserId("anonymous");
+        console.log("No authenticated user, using anonymous");
+      }
+    };
+
+    fetchUser();
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -44,12 +65,25 @@ export default function WebcamPage() {
       console.log("WebSocket connected");
       setIsConnected(true);
       setError("");
+
+      // Send user authentication immediately after connection
+      if (userId) {
+        ws.send(
+          JSON.stringify({
+            type: "auth",
+            user_id: userId,
+          })
+        );
+        console.log("Sent user_id to backend:", userId);
+      }
     };
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
 
-      if (data.type === "feedback") {
+      if (data.type === "auth_success") {
+        console.log("Authentication successful:", data.session_id);
+      } else if (data.type === "feedback") {
         setFeedbackText(data.message);
       } else if (data.type === "status") {
         const processed =
@@ -169,6 +203,12 @@ export default function WebcamPage() {
 
   const startWebcam = async () => {
     try {
+      // Ensure we have a user ID before starting
+      if (!userId) {
+        setError("User authentication required. Please wait...");
+        return;
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 1280, height: 720 },
         audio: true,

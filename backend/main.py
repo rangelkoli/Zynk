@@ -1,12 +1,12 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import json
 import base64
 import asyncio
 import uuid
-from video_recorder import VideoRecorder, upload_to_supabase
+from video_recorder import VideoRecorder, upload_to_supabase, get_user_videos
 
 app = FastAPI(title="Zynk API", version="1.0.0")
 
@@ -68,6 +68,33 @@ async def get_item(item_id: int):
         "price": 10.99 * item_id
     }
 
+@app.get("/api/videos/{user_id}")
+async def get_videos(user_id: str):
+    """Get all videos for a specific user"""
+    try:
+        videos = await get_user_videos(user_id)
+        
+        if videos is None:
+            return {
+                "success": False,
+                "message": "Error retrieving videos",
+                "videos": []
+            }
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "count": len(videos),
+            "videos": videos
+        }
+    except Exception as e:
+        print(f"Error in get_videos endpoint: {e}")
+        return {
+            "success": False,
+            "message": str(e),
+            "videos": []
+        }
+
 # Store active video recorders
 active_recorders: Dict[str, VideoRecorder] = {}
 
@@ -81,6 +108,7 @@ async def websocket_video_endpoint(websocket: WebSocket):
     # Generate unique session ID for this connection
     session_id = str(uuid.uuid4())
     video_recorder = None
+    user_id = "anonymous"  # Default value
     
     try:
         data_chunk_count = 0
@@ -99,11 +127,22 @@ async def websocket_video_endpoint(websocket: WebSocket):
             message = json.loads(data)
             message_type = message.get("type")
             
+            # Handle user authentication message
+            if message_type == "auth":
+                user_id = message.get("user_id", "anonymous")
+                print(f"User authenticated: {user_id} for session {session_id}")
+                await websocket.send_json({
+                    "type": "auth_success",
+                    "session_id": session_id,
+                    "message": "Authentication successful"
+                })
+                continue
+            
             if message_type == "video_chunk":
                 if video_recorder is None:
-                    video_recorder = VideoRecorder(session_id, fps=30)
+                    video_recorder = VideoRecorder(session_id, user_id=user_id, fps=30)
                     active_recorders[session_id] = video_recorder
-                    print(f"Started recording for session {session_id}")
+                    print(f"Started recording for session {session_id}, user {user_id}")
 
                 data_chunk_count += 1
 
@@ -125,9 +164,9 @@ async def websocket_video_endpoint(websocket: WebSocket):
 
             elif message_type == "video_complete":
                 if video_recorder is None:
-                    video_recorder = VideoRecorder(session_id, fps=30)
+                    video_recorder = VideoRecorder(session_id, user_id=user_id, fps=30)
                     active_recorders[session_id] = video_recorder
-                    print(f"Started recording for session {session_id}")
+                    print(f"Started recording for session {session_id}, user {user_id}")
 
                 complete_data = message.get("data", "")
                 if complete_data:
@@ -149,9 +188,9 @@ async def websocket_video_endpoint(websocket: WebSocket):
             elif message_type == "frame":
                 # Initialize video recorder on first frame
                 if video_recorder is None:
-                    video_recorder = VideoRecorder(session_id, fps=30)
+                    video_recorder = VideoRecorder(session_id, user_id=user_id, fps=30)
                     active_recorders[session_id] = video_recorder
-                    print(f"Started recording for session {session_id}")
+                    print(f"Started recording for session {session_id}, user {user_id}")
                 
                 # Add frame to recorder
                 frame_data = message.get("data", "")
@@ -185,9 +224,9 @@ async def websocket_video_endpoint(websocket: WebSocket):
                 print(f"Received audio chunk for session {session_id}")
                 # Handle audio chunks
                 if video_recorder is None:
-                    video_recorder = VideoRecorder(session_id, fps=30)
+                    video_recorder = VideoRecorder(session_id, user_id=user_id, fps=30)
                     active_recorders[session_id] = video_recorder
-                    print(f"Started recording for session {session_id}")
+                    print(f"Started recording for session {session_id}, user {user_id}")
                 
                 # Add audio chunk to recorder
                 audio_data = message.get("data", "")
@@ -210,7 +249,7 @@ async def websocket_video_endpoint(websocket: WebSocket):
                     
                     if video_path:
                         # Upload to Supabase
-                        public_url = await upload_to_supabase(video_path, session_id)
+                        public_url = await upload_to_supabase(video_path, session_id, user_id)
                         
                         if public_url:
                             # Send success response with video URL

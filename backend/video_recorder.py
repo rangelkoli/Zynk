@@ -27,23 +27,26 @@ if supabase_url and supabase_key:
 class VideoRecorder:
     """Handles video and audio recording from WebSocket frames"""
     
-    def __init__(self, session_id: str, fps: int = 60):
+    def __init__(self, session_id: str, user_id: str = "anonymous", fps: int = 60):
         self.session_id = session_id
+        self.user_id = user_id
         self.fps = fps
         self.frames: List[np.ndarray] = []
         self.audio_chunks: List[bytes] = []
-        self.temp_video_path = f"temp_videos/{session_id}_video.mp4"
-        self.temp_audio_path = f"temp_videos/{session_id}_audio.webm"
-        self.temp_combined_video_path = f"temp_videos/{session_id}_combined.webm"
-        self.final_video_path = f"temp_videos/{session_id}_final.mp4"
+        
+        # Create user-specific directory structure
+        self.user_session_dir = f"temp_videos/{user_id}/{session_id}"
+        os.makedirs(self.user_session_dir, exist_ok=True)
+        
+        self.temp_video_path = f"{self.user_session_dir}/video.mp4"
+        self.temp_audio_path = f"{self.user_session_dir}/audio.webm"
+        self.temp_combined_video_path = f"{self.user_session_dir}/combined.webm"
+        self.final_video_path = f"{self.user_session_dir}/final.mp4"
         self.has_combined_blob = False
         
         # Audio properties (will be set when first audio chunk arrives)
         self.audio_sample_rate = 48000  # Default for WebM
         self.audio_channels = 1  # Mono
-        
-        # Create temp directory if it doesn't exist
-        os.makedirs("temp_videos", exist_ok=True)
     
     def add_frame(self, base64_frame: str):
         """Add a frame to the recording"""
@@ -227,20 +230,31 @@ class VideoRecorder:
             if os.path.exists(self.final_video_path):
                 os.remove(self.final_video_path)
                 print(f"Cleaned up {self.final_video_path}")
+            
+            # Remove the session directory if empty
+            if os.path.exists(self.user_session_dir) and not os.listdir(self.user_session_dir):
+                os.rmdir(self.user_session_dir)
+                print(f"Cleaned up {self.user_session_dir}")
+            
+            # Remove user directory if empty
+            user_dir = f"temp_videos/{self.user_id}"
+            if os.path.exists(user_dir) and not os.listdir(user_dir):
+                os.rmdir(user_dir)
+                print(f"Cleaned up {user_dir}")
         except Exception as e:
             print(f"Error cleaning up: {e}")
 
 
-async def upload_to_supabase(video_path: str, session_id: str) -> Optional[str]:
-    """Upload video to Supabase storage"""
+async def upload_to_supabase(video_path: str, session_id: str, user_id: str = "anonymous") -> Optional[str]:
+    """Upload video to Supabase storage with organized path structure"""
     if not supabase:
         print("Supabase client not initialized")
         return None
     
     try:
-        # Generate unique filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"session_{session_id}_{timestamp}.mp4"
+
+        # Organize in Supabase storage as: user_id/session_id/video.mp4
+        storage_path = f"{user_id}/{session_id}.mp4"
         
         # Read video file
         with open(video_path, "rb") as f:
@@ -248,16 +262,79 @@ async def upload_to_supabase(video_path: str, session_id: str) -> Optional[str]:
         
         # Upload to Supabase storage
         response = supabase.storage.from_(supabase_bucket).upload(
-            filename,
+            storage_path,
             video_data,
             file_options={"content-type": "video/mp4"}
         )
         
         # Get public URL
-        public_url = supabase.storage.from_(supabase_bucket).get_public_url(filename)
+        public_url = supabase.storage.from_(supabase_bucket).get_public_url(storage_path)
         
         print(f"Video uploaded to Supabase: {public_url}")
         return public_url
     except Exception as e:
         print(f"Error uploading to Supabase: {e}")
+        return None
+
+
+async def get_user_videos(user_id: str) -> Optional[List[dict]]:
+    """Retrieve all videos for a specific user from Supabase storage"""
+    if not supabase:
+        print("Supabase client not initialized")
+        return None
+    
+    try:
+        # List all files in the user's folder
+        response = (
+            supabase.storage
+            .from_("videos")
+            .list(
+                path=f"{user_id}/",
+
+            )
+        )
+        print(response)
+        
+        if not response:
+            print(f"No videos found for user {user_id}")
+            return []
+        
+        videos = []
+        for file in response:
+            # Skip folders and files without metadata (folders don't have .mp4 extension)
+            if not file.get('name', '').endswith('.mp4'):
+                print(f"Skipping non-video file/folder: {file.get('name')}")
+                continue
+                
+            # Skip if no metadata (folders don't have metadata)
+            if not file.get('metadata'):
+                print(f"Skipping item without metadata: {file.get('name')}")
+                continue
+            
+            # Each file represents a session
+            file_path = f"{user_id}/{file['name']}"
+            
+            # Get public URL
+            public_url = supabase.storage.from_(supabase_bucket).get_public_url(file_path)
+            
+            # Extract session_id from filename (remove .mp4 extension)
+            session_id = file['name'].replace('.mp4', '')
+            
+            video_info = {
+                "session_id": session_id,
+                "url": public_url,
+                "created_at": file.get('created_at', ''),
+                "updated_at": file.get('updated_at', ''),
+                "size": file.get('metadata', {}).get('size', 0),
+                "name": file['name']
+            }
+            videos.append(video_info)
+        
+        # Sort by created date (newest first)
+        videos.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        
+        print(f"Found {len(videos)} videos for user {user_id}")
+        return videos
+    except Exception as e:
+        print(f"Error retrieving videos for user {user_id}: {e}")
         return None
