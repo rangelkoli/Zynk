@@ -12,31 +12,27 @@ import {
 
 export default function WebcamPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const videoChunksRef = useRef<Blob[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string>("");
   const [feedbackText, setFeedbackText] = useState(
     "Position yourself in the center"
   );
-  const [framesProcessed, setFramesProcessed] = useState(0);
 
   useEffect(() => {
     return () => {
-      // Cleanup: stop all video tracks when component unmounts
       if (videoRef.current && videoRef.current.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
         stream.getTracks().forEach((track) => track.stop());
       }
-      // Cleanup WebSocket connection
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
+      }
       if (wsRef.current) {
         wsRef.current.close();
-      }
-      // Cleanup frame capture interval
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current);
       }
     };
   }, []);
@@ -56,7 +52,23 @@ export default function WebcamPage() {
       if (data.type === "feedback") {
         setFeedbackText(data.message);
       } else if (data.type === "status") {
-        setFramesProcessed(data.frames_processed);
+        const processed =
+          data.segments_processed ?? data.frames_processed ?? data.timestamp;
+        setFeedbackText(
+          processed
+            ? `Recording in progress… (${processed} segments captured)`
+            : "Recording in progress…"
+        );
+      } else if (data.type === "upload_complete") {
+        setFeedbackText(`Video uploaded successfully! URL: ${data.url}`);
+        console.log("Video URL:", data.url);
+        ws.close();
+        wsRef.current = null;
+      } else if (data.type === "upload_error") {
+        setFeedbackText(`Error: ${data.message}`);
+        setError(data.message);
+        ws.close();
+        wsRef.current = null;
       }
     };
 
@@ -69,59 +81,97 @@ export default function WebcamPage() {
     ws.onclose = () => {
       console.log("WebSocket disconnected");
       setIsConnected(false);
+      wsRef.current = null;
     };
 
     wsRef.current = ws;
   };
 
-  const captureAndSendFrame = () => {
-    if (!videoRef.current || !canvasRef.current || !wsRef.current) return;
-    if (wsRef.current.readyState !== WebSocket.OPEN) return;
+  const startMediaRecording = (stream: MediaStream) => {
+    const mimeType = "video/webm;codecs=vp8,opus";
 
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const context = canvas.getContext("2d");
-
-    if (!context) return;
-
-    // Set canvas size to match video
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    // Draw video frame to canvas
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    // Convert canvas to base64 image
-    const imageData = canvas.toDataURL("image/jpeg", 0.8);
-
-    // Send frame to WebSocket
-    wsRef.current.send(
-      JSON.stringify({
-        type: "frame",
-        data: imageData,
-      })
-    );
-  };
-
-  const startFrameCapture = () => {
-    // Capture and send frames at ~10 FPS (every 100ms)
-    intervalRef.current = setInterval(() => {
-      captureAndSendFrame();
-    }, 100);
-  };
-
-  const stopFrameCapture = () => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
+    if (!MediaRecorder.isTypeSupported(mimeType)) {
+      console.error("MIME type not supported");
+      setError("Browser doesn't support required video format");
+      return;
     }
+
+    const mediaRecorder = new MediaRecorder(stream, {
+      mimeType: mimeType,
+      videoBitsPerSecond: 2500000,
+      audioBitsPerSecond: 128000,
+    });
+
+    videoChunksRef.current = [];
+
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+        videoChunksRef.current.push(event.data);
+
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          const base64Data = reader.result as string;
+          wsRef.current?.send(
+            JSON.stringify({
+              type: "video_chunk",
+              data: base64Data,
+            })
+          );
+        };
+        reader.readAsDataURL(event.data);
+      }
+    };
+
+    mediaRecorder.onstop = () => {
+      const recordedChunks = videoChunksRef.current;
+      videoChunksRef.current = [];
+
+      if (!recordedChunks.length) {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "stop",
+            })
+          );
+        }
+        mediaRecorderRef.current = null;
+        return;
+      }
+
+      const blob = new Blob(recordedChunks, { type: mimeType });
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64Data = reader.result as string;
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: "video_complete",
+              data: base64Data,
+            })
+          );
+
+          wsRef.current.send(
+            JSON.stringify({
+              type: "stop",
+            })
+          );
+        }
+      };
+
+      reader.readAsDataURL(blob);
+      mediaRecorderRef.current = null;
+    };
+
+    mediaRecorder.start(1000); // Send chunks every second
+    mediaRecorderRef.current = mediaRecorder;
   };
 
   const startWebcam = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 1280, height: 720 },
-        audio: false,
+        audio: true,
       });
 
       if (videoRef.current) {
@@ -130,17 +180,15 @@ export default function WebcamPage() {
         setError("");
         setFeedbackText("Great! You're all set");
 
-        // Connect WebSocket and start frame capture
         connectWebSocket();
 
-        // Wait a bit for video to start playing before capturing frames
         setTimeout(() => {
-          startFrameCapture();
+          startMediaRecording(stream);
         }, 1000);
       }
     } catch (err) {
-      setError("Unable to access webcam. Please check permissions.");
-      console.error("Error accessing webcam:", err);
+      setError("Unable to access webcam/microphone. Please check permissions.");
+      console.error("Error accessing media devices:", err);
     }
   };
 
@@ -150,38 +198,18 @@ export default function WebcamPage() {
       stream.getTracks().forEach((track) => track.stop());
       videoRef.current.srcObject = null;
       setIsStreaming(false);
-      setFeedbackText("Webcam stopped");
+      setFeedbackText("Processing and uploading video...");
 
-      // Stop frame capture and close WebSocket
-      stopFrameCapture();
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.stop();
       }
     }
   };
 
-  const feedbackOptions = [
-    { text: "Position yourself in the center", label: "Center Position" },
-    { text: "Move closer to the camera", label: "Move Closer" },
-    { text: "Perfect! Hold still", label: "Hold Still" },
-    { text: "Great! You're all set", label: "All Set" },
-  ];
-
   return (
     <main className='h-screen bg-gray-50 dark:bg-gray-950 flex items-center justify-center p-4 sm:p-6 lg:p-8'>
       <div className='w-full mx-auto'>
-        {/* <div className='text-center mb-8'>
-          <h1 className='text-3xl sm:text-4xl font-bold tracking-tight'>
-            Real-time Session
-          </h1>
-          <p className='mt-2 text-lg text-muted-foreground'>
-            Your personal AI-powered feedback assistant
-          </p>
-        </div> */}
-
         <div className='grid grid-cols-1 lg:grid-cols-3 gap-6'>
-          {/* Video Player Column */}
           <div className='lg:col-span-2'>
             <Card className='overflow-hidden shadow-lg'>
               <div className='relative aspect-video bg-muted rounded-t-lg'>
@@ -192,9 +220,6 @@ export default function WebcamPage() {
                   muted
                   className='w-full h-full object-cover'
                 />
-
-                {/* Hidden canvas for frame capture */}
-                <canvas ref={canvasRef} className='hidden' />
 
                 {!isStreaming && (
                   <div className='absolute inset-0 flex items-center justify-center bg-black/50'>
@@ -230,7 +255,6 @@ export default function WebcamPage() {
             </Card>
           </div>
 
-          {/* Controls Column */}
           <div className='space-y-6'>
             <Card className='shadow-lg'>
               <CardHeader>
@@ -254,7 +278,6 @@ export default function WebcamPage() {
                   )}
                 </div>
 
-                {/* WebSocket Status */}
                 <div className='flex items-center space-x-2 text-sm'>
                   <div
                     className={`w-2 h-2 rounded-full ${
@@ -266,13 +289,6 @@ export default function WebcamPage() {
                   </span>
                 </div>
 
-                {/* Frames Processed */}
-                {framesProcessed > 0 && (
-                  <div className='text-sm text-muted-foreground'>
-                    Frames processed: {framesProcessed}
-                  </div>
-                )}
-
                 {error && (
                   <div className='bg-destructive/10 text-destructive px-3 py-2 rounded-md text-sm font-medium'>
                     <p>{error}</p>
@@ -280,28 +296,6 @@ export default function WebcamPage() {
                 )}
               </CardContent>
             </Card>
-
-            {/* <Card className='shadow-lg'>
-              <CardHeader>
-                <CardTitle>Feedback Simulator</CardTitle>
-                <CardDescription>
-                  Manually trigger feedback messages.
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className='grid grid-cols-2 gap-2'>
-                  {feedbackOptions.map((opt) => (
-                    <Button
-                      key={opt.label}
-                      variant='outline'
-                      onClick={() => setFeedbackText(opt.text)}
-                    >
-                      {opt.label}
-                    </Button>
-                  ))}
-                </div>
-              </CardContent>
-            </Card> */}
           </div>
         </div>
       </div>

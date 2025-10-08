@@ -23,7 +23,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Zynk",
+  title: "SpeakFlow",
   description: "Your personal AI-powered feedback assistant",
 };
 
@@ -34,24 +34,24 @@ export default function RootLayout({
 }>) {
   return (
     <ClerkProvider>
-      <html lang="en" suppressHydrationWarning>
+      <html lang='en' suppressHydrationWarning>
         <body
           className={`${geistSans.variable} ${geistMono.variable} antialiased`}
         >
           <ThemeProvider
-            attribute="class"
-            defaultTheme="system"
+            attribute='class'
+            defaultTheme='system'
             enableSystem
             disableTransitionOnChange
           >
-            <header className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between gap-4 p-4 border-b h-16 bg-background">
-              <div className="font-bold text-lg">Zynk</div>
-              <div className="flex items-center gap-4">
+            <header className='fixed top-0 left-0 right-0 z-50 flex items-center justify-between gap-4 p-4 border-b h-16 bg-background'>
+              <div className='font-bold text-lg'>Zynk</div>
+              <div className='flex items-center gap-4'>
                 <ThemeToggle />
                 <SignedOut>
                   <SignInButton />
                   <SignUpButton>
-                    <button className="cursor-pointer rounded-full bg-[#6c47ff] px-4 sm:px-5 font-medium text-ceramic-white h-10 text-sm sm:h-12 sm:text-base">
+                    <button className='cursor-pointer rounded-full bg-[#6c47ff] px-4 sm:px-5 font-medium text-ceramic-white h-10 text-sm sm:h-12 sm:text-base'>
                       Sign Up
                     </button>
                   </SignUpButton>
@@ -61,7 +61,7 @@ export default function RootLayout({
                 </SignedIn>
               </div>
             </header>
-            <main className="pt-16">{children}</main>
+            <main className='pt-16'>{children}</main>
           </ThemeProvider>
         </body>
       </html>

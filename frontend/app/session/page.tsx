@@ -33,7 +33,7 @@ const SessionPage = () => (
             muted
             preload='auto'
             slot='media'
-            src='https://stream.mux.com/DS00Spx1CV902MCtPj5WknGlR102V5HFkDe/high.mp4'
+            src='https://ujxxxbaxufctjhuwzslf.supabase.co/storage/v1/object/public/videos/session_3a838896-72af-4585-bf9c-5ee0b7e93ff2_20251005_000607.mp4'
           />
           <VideoPlayerControlBar>
             <VideoPlayerPlayButton />

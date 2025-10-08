@@ -1,10 +1,12 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict
 import json
 import base64
 import asyncio
+import uuid
+from video_recorder import VideoRecorder, upload_to_supabase
 
 app = FastAPI(title="Zynk API", version="1.0.0")
 
@@ -66,6 +68,9 @@ async def get_item(item_id: int):
         "price": 10.99 * item_id
     }
 
+# Store active video recorders
+active_recorders: Dict[str, VideoRecorder] = {}
+
 # WebSocket endpoint for real-time video processing
 @app.websocket("/ws/video")
 async def websocket_video_endpoint(websocket: WebSocket):
@@ -73,8 +78,12 @@ async def websocket_video_endpoint(websocket: WebSocket):
     await websocket.accept()
     print("WebSocket connection established")
     
+    # Generate unique session ID for this connection
+    session_id = str(uuid.uuid4())
+    video_recorder = None
+    
     try:
-        frame_count = 0
+        data_chunk_count = 0
         feedback_messages = [
             "Position yourself in the center",
             "Move closer to the camera",
@@ -88,40 +97,164 @@ async def websocket_video_endpoint(websocket: WebSocket):
             # Receive data from client
             data = await websocket.receive_text()
             message = json.loads(data)
+            message_type = message.get("type")
             
-            if message.get("type") == "frame":
-                frame_count += 1
+            if message_type == "video_chunk":
+                if video_recorder is None:
+                    video_recorder = VideoRecorder(session_id, fps=30)
+                    active_recorders[session_id] = video_recorder
+                    print(f"Started recording for session {session_id}")
+
+                data_chunk_count += 1
+
+                if data_chunk_count % 5 == 0:
+                    feedback_index = (data_chunk_count // 5) % len(feedback_messages)
+                    feedback = {
+                        "type": "feedback",
+                        "message": feedback_messages[feedback_index],
+                        "timestamp": data_chunk_count,
+                    }
+                    await websocket.send_json(feedback)
+
+                    status = {
+                        "type": "status",
+                        "segments_processed": data_chunk_count,
+                        "message": "Recording...",
+                    }
+                    await websocket.send_json(status)
+
+            elif message_type == "video_complete":
+                if video_recorder is None:
+                    video_recorder = VideoRecorder(session_id, fps=30)
+                    active_recorders[session_id] = video_recorder
+                    print(f"Started recording for session {session_id}")
+
+                complete_data = message.get("data", "")
+                if complete_data:
+                    video_recorder.set_final_webm_blob(complete_data)
+                    await websocket.send_json(
+                        {
+                            "type": "status",
+                            "message": "Final video received. Preparing upload…",
+                        }
+                    )
+                else:
+                    await websocket.send_json(
+                        {
+                            "type": "upload_error",
+                            "message": "No video data provided",
+                        }
+                    )
+
+            elif message_type == "frame":
+                # Initialize video recorder on first frame
+                if video_recorder is None:
+                    video_recorder = VideoRecorder(session_id, fps=30)
+                    active_recorders[session_id] = video_recorder
+                    print(f"Started recording for session {session_id}")
+                
+                # Add frame to recorder
+                frame_data = message.get("data", "")
+                video_recorder.add_frame(frame_data)
+                
+                data_chunk_count += 1
                 
                 # Here you can process the frame (base64 encoded image)
                 # For now, we'll send periodic feedback
                 
                 # Send feedback every 30 frames (roughly every second at 30fps)
-                if frame_count % 30 == 0:
-                    feedback_index = (frame_count // 30) % len(feedback_messages)
+                if data_chunk_count % 30 == 0:
+                    feedback_index = (data_chunk_count // 30) % len(feedback_messages)
                     feedback = {
                         "type": "feedback",
                         "message": feedback_messages[feedback_index],
-                        "timestamp": frame_count
+                        "timestamp": data_chunk_count
                     }
                     await websocket.send_json(feedback)
                 
                 # Send acknowledgment
-                if frame_count % 60 == 0:
+                if data_chunk_count % 60 == 0:
                     status = {
                         "type": "status",
-                        "frames_processed": frame_count,
+                        "segments_processed": data_chunk_count,
                         "message": "Processing..."
                     }
                     await websocket.send_json(status)
                     
-            elif message.get("type") == "ping":
+            elif message_type == "audio":
+                print(f"Received audio chunk for session {session_id}")
+                # Handle audio chunks
+                if video_recorder is None:
+                    video_recorder = VideoRecorder(session_id, fps=30)
+                    active_recorders[session_id] = video_recorder
+                    print(f"Started recording for session {session_id}")
+                
+                # Add audio chunk to recorder
+                audio_data = message.get("data", "")
+                video_recorder.add_audio_chunk(audio_data)
+                    
+            elif message_type == "stop":
+                # Handle stop recording request
+                print(f"Stop recording request received for session {session_id}")
+                
+                if video_recorder:
+                    await websocket.send_json(
+                        {
+                            "type": "status",
+                            "message": "Processing recording…",
+                        }
+                    )
+
+                    # Save video to disk
+                    video_path = video_recorder.save_video()
+                    
+                    if video_path:
+                        # Upload to Supabase
+                        public_url = await upload_to_supabase(video_path, session_id)
+                        
+                        if public_url:
+                            # Send success response with video URL
+                            await websocket.send_json({
+                                "type": "upload_complete",
+                                "url": public_url,
+                                "message": "Video uploaded successfully"
+                            })
+                        else:
+                            await websocket.send_json({
+                                "type": "upload_error",
+                                "message": "Failed to upload video to Supabase"
+                            })
+                        
+                        # Cleanup temporary file
+                        video_recorder.cleanup()
+                    else:
+                        await websocket.send_json({
+                            "type": "upload_error",
+                            "message": "Failed to save video"
+                        })
+                    
+                    # Remove from active recorders
+                    if session_id in active_recorders:
+                        del active_recorders[session_id]
+                
+                break  # Exit the loop after handling stop
+                    
+            elif message_type == "ping":
                 # Respond to ping messages to keep connection alive
                 await websocket.send_json({"type": "pong"})
                 
     except WebSocketDisconnect:
-        print("WebSocket connection closed")
+        print(f"WebSocket connection closed for session {session_id}")
+        # Cleanup recorder if connection closed unexpectedly
+        if session_id in active_recorders:
+            active_recorders[session_id].cleanup()
+            del active_recorders[session_id]
     except Exception as e:
         print(f"WebSocket error: {e}")
+        # Cleanup recorder on error
+        if session_id in active_recorders:
+            active_recorders[session_id].cleanup()
+            del active_recorders[session_id]
         await websocket.close()
 
 # Run the server
