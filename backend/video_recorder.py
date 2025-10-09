@@ -10,6 +10,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import subprocess
 import wave
+from pathlib import Path
 
 # Load environment variables
 load_dotenv()
@@ -143,13 +144,49 @@ class VideoRecorder:
                 print(f"Converted WebM blob to MP4: {self.final_video_path}")
                 return self.final_video_path
             except subprocess.CalledProcessError as e:
-                print(f"FFmpeg conversion error: {e.stderr}")
-                print("Falling back to raw WebM upload")
-                return self.temp_combined_video_path
+                print(f"FFmpeg conversion error (primary pipeline): {e.stderr}")
+                print("Attempting simplified fallback conversion…")
+
+                fallback_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    self.temp_combined_video_path,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-crf",
+                    "23",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-movflags",
+                    "+faststart",
+                    self.final_video_path,
+                ]
+
+                try:
+                    subprocess.run(
+                        fallback_cmd,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    print(
+                        f"Fallback FFmpeg conversion succeeded: {self.final_video_path}"
+                    )
+                    return self.final_video_path
+                except subprocess.CalledProcessError as fallback_error:
+                    print(
+                        f"Fallback FFmpeg conversion failed: {fallback_error.stderr}"
+                    )
+                    return None
             except FileNotFoundError:
-                print("FFmpeg not found. Returning WebM recording.")
+                print("FFmpeg not found. Cannot convert WebM to MP4.")
                 print("Install FFmpeg: brew install ffmpeg (on macOS)")
-                return self.temp_combined_video_path
+                return None
             except Exception as e:
                 print(f"Error converting WebM blob: {e}")
                 return None
@@ -252,20 +289,48 @@ async def upload_to_supabase(video_path: str, session_id: str, user_id: str = "a
         return None
     
     try:
+        # Determine extension/content type based on saved file
+        file_path = Path(video_path)
+        extension = file_path.suffix.lower()
 
-        # Organize in Supabase storage as: user_id/session_id/video.mp4
+        if extension != ".mp4":
+            print(
+                f"Upload aborted: expected MP4 file but received '{extension or 'unknown'}'"
+            )
+            return None
+
+        content_type = "video/mp4"
+
+        # Organize in Supabase storage as: user_id/session_id.mp4
         storage_path = f"{user_id}/{session_id}.mp4"
         
         # Read video file
         with open(video_path, "rb") as f:
             video_data = f.read()
+
+        if not video_data:
+            print("Supabase upload aborted: video file is empty")
+            return None
+
+        file_size = len(video_data)
+
+        print(
+            f"Uploading {storage_path} to Supabase (size={file_size} bytes, content_type={content_type})"
+        )
         
         # Upload to Supabase storage
+        file_options = {
+            "content-type": content_type,
+            # Supabase Python client expects header values to be strings
+            "upsert": "true"
+        }
+
         response = supabase.storage.from_(supabase_bucket).upload(
             storage_path,
             video_data,
-            file_options={"content-type": "video/mp4"}
+            file_options=file_options
         )
+        print(f"Supabase upload response: {response}")
         
         # Get public URL
         public_url = supabase.storage.from_(supabase_bucket).get_public_url(storage_path)
@@ -293,7 +358,8 @@ async def get_user_videos(user_id: str) -> Optional[List[dict]]:
 
             )
         )
-        print(response)
+        print(f"Supabase list response: {response}")
+        print(f"Length of response: {len(response) if response else 0}")
         
         if not response:
             print(f"No videos found for user {user_id}")

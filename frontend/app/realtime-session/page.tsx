@@ -16,12 +16,14 @@ export default function WebcamPage() {
   const wsRef = useRef<WebSocket | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const videoChunksRef = useRef<Blob[]>([]);
+  const frameIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string>("");
   const [feedbackText, setFeedbackText] = useState(
     "Position yourself in the center"
   );
+  const [isAIFeedback, setIsAIFeedback] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const supabase = createClient();
 
@@ -51,6 +53,9 @@ export default function WebcamPage() {
       }
       if (mediaRecorderRef.current) {
         mediaRecorderRef.current.stop();
+      }
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
       }
       if (wsRef.current) {
         wsRef.current.close();
@@ -83,8 +88,18 @@ export default function WebcamPage() {
 
       if (data.type === "auth_success") {
         console.log("Authentication successful:", data.session_id);
+      } else if (data.type === "ai_feedback") {
+        // Handle AI feedback from the feedback agent
+        console.log("AI Feedback received:", data.message);
+        if (data.message !== "OK") {
+          setFeedbackText(data.message);
+          setIsAIFeedback(true);
+          // Clear AI feedback flag after 4 seconds
+          setTimeout(() => setIsAIFeedback(false), 4000);
+        }
       } else if (data.type === "feedback") {
         setFeedbackText(data.message);
+        setIsAIFeedback(false);
       } else if (data.type === "status") {
         const processed =
           data.segments_processed ?? data.frames_processed ?? data.timestamp;
@@ -93,13 +108,16 @@ export default function WebcamPage() {
             ? `Recording in progress… (${processed} segments captured)`
             : "Recording in progress…"
         );
+        setIsAIFeedback(false);
       } else if (data.type === "upload_complete") {
         setFeedbackText(`Video uploaded successfully! URL: ${data.url}`);
+        setIsAIFeedback(false);
         console.log("Video URL:", data.url);
         ws.close();
         wsRef.current = null;
       } else if (data.type === "upload_error") {
         setFeedbackText(`Error: ${data.message}`);
+        setIsAIFeedback(false);
         setError(data.message);
         ws.close();
         wsRef.current = null;
@@ -139,20 +157,27 @@ export default function WebcamPage() {
     videoChunksRef.current = [];
 
     mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0 && wsRef.current?.readyState === WebSocket.OPEN) {
+      if (event.data.size > 0) {
+        // Always accumulate chunks for final video
         videoChunksRef.current.push(event.data);
+        console.log(
+          `Chunk received: ${event.data.size} bytes, total chunks: ${videoChunksRef.current.length}`
+        );
 
-        const reader = new FileReader();
-        reader.onloadend = () => {
-          const base64Data = reader.result as string;
-          wsRef.current?.send(
-            JSON.stringify({
-              type: "video_chunk",
-              data: base64Data,
-            })
-          );
-        };
-        reader.readAsDataURL(event.data);
+        // Also send chunk to server (for real-time processing if needed)
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64Data = reader.result as string;
+            wsRef.current?.send(
+              JSON.stringify({
+                type: "video_chunk",
+                data: base64Data,
+              })
+            );
+          };
+          reader.readAsDataURL(event.data);
+        }
       }
     };
 
@@ -160,7 +185,12 @@ export default function WebcamPage() {
       const recordedChunks = videoChunksRef.current;
       videoChunksRef.current = [];
 
+      console.log(
+        `MediaRecorder stopped. Total chunks: ${recordedChunks.length}`
+      );
+
       if (!recordedChunks.length) {
+        console.log("No recorded chunks, sending stop without video");
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(
             JSON.stringify({
@@ -173,9 +203,14 @@ export default function WebcamPage() {
       }
 
       const blob = new Blob(recordedChunks, { type: mimeType });
+      console.log(
+        `Creating final blob: ${blob.size} bytes from ${recordedChunks.length} chunks`
+      );
+
       const reader = new FileReader();
       reader.onloadend = () => {
         const base64Data = reader.result as string;
+        console.log(`Sending complete video: ${base64Data.length} chars`);
 
         if (wsRef.current?.readyState === WebSocket.OPEN) {
           wsRef.current.send(
@@ -190,6 +225,8 @@ export default function WebcamPage() {
               type: "stop",
             })
           );
+        } else {
+          console.error("WebSocket not open, cannot send video");
         }
       };
 
@@ -199,6 +236,40 @@ export default function WebcamPage() {
 
     mediaRecorder.start(1000); // Send chunks every second
     mediaRecorderRef.current = mediaRecorder;
+
+    // Capture frames for AI analysis every second
+    startFrameCapture();
+  };
+
+  const startFrameCapture = () => {
+    // Capture and send a frame every second for AI analysis
+    frameIntervalRef.current = setInterval(() => {
+      if (videoRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+        const canvas = document.createElement("canvas");
+        canvas.width = videoRef.current.videoWidth;
+        canvas.height = videoRef.current.videoHeight;
+
+        const ctx = canvas.getContext("2d");
+        if (ctx && canvas.width > 0 && canvas.height > 0) {
+          ctx.drawImage(videoRef.current, 0, 0);
+          const base64Frame = canvas.toDataURL("image/jpeg", 0.7);
+
+          console.log(
+            `Sending frame: ${canvas.width}x${canvas.height}, size: ${base64Frame.length} chars`
+          );
+
+          // Send frame for AI analysis
+          wsRef.current.send(
+            JSON.stringify({
+              type: "frame",
+              data: base64Frame,
+            })
+          );
+        } else {
+          console.log("Canvas not ready yet:", canvas.width, canvas.height);
+        }
+      }
+    }, 1000); // Send one frame per second
   };
 
   const startWebcam = async () => {
@@ -239,6 +310,11 @@ export default function WebcamPage() {
       videoRef.current.srcObject = null;
       setIsStreaming(false);
       setFeedbackText("Processing and uploading video...");
+
+      if (frameIntervalRef.current) {
+        clearInterval(frameIntervalRef.current);
+        frameIntervalRef.current = null;
+      }
 
       if (mediaRecorderRef.current) {
         mediaRecorderRef.current.stop();
@@ -285,7 +361,30 @@ export default function WebcamPage() {
                 )}
 
                 <div className='absolute inset-x-0 bottom-0 flex items-end justify-center pb-4 pointer-events-none'>
-                  <div className='bg-black/60 text-white px-4 py-2 rounded-lg backdrop-blur-sm'>
+                  <div
+                    className={`px-4 py-2 rounded-lg backdrop-blur-sm transition-all duration-300 ${
+                      isAIFeedback
+                        ? "bg-amber-800 text-white border-2 border-white/30 shadow-lg"
+                        : "bg-black/60 text-white"
+                    }`}
+                  >
+                    {isAIFeedback && (
+                      <div className='flex items-center gap-2 mb-1'>
+                        <svg
+                          className='w-4 h-4'
+                          fill='currentColor'
+                          viewBox='0 0 20 20'
+                        >
+                          <path d='M13 7H7v6h6V7z' />
+                          <path
+                            fillRule='evenodd'
+                            d='M7 2a1 1 0 012 0v1h2V2a1 1 0 112 0v1h2a2 2 0 012 2v2h1a1 1 0 110 2h-1v2h1a1 1 0 110 2h-1v2a2 2 0 01-2 2h-2v1a1 1 0 11-2 0v-1H9v1a1 1 0 11-2 0v-1H5a2 2 0 01-2-2v-2H2a1 1 0 110-2h1V9H2a1 1 0 010-2h1V5a2 2 0 012-2h2V2zM5 5h10v10H5V5z'
+                            clipRule='evenodd'
+                          />
+                        </svg>
+                        <span className='text-xs font-semibold'>AI Coach</span>
+                      </div>
+                    )}
                     <p className='text-lg font-medium text-center'>
                       {feedbackText}
                     </p>

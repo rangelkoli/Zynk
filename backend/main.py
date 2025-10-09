@@ -7,6 +7,7 @@ import base64
 import asyncio
 import uuid
 from video_recorder import VideoRecorder, upload_to_supabase, get_user_videos
+from feedback_agent import FeedbackAgent
 
 app = FastAPI(title="Zynk API", version="1.0.0")
 
@@ -95,31 +96,31 @@ async def get_videos(user_id: str):
             "videos": []
         }
 
-# Store active video recorders
+# Store active video recorders and feedback agents
 active_recorders: Dict[str, VideoRecorder] = {}
+active_feedback_agents: Dict[str, FeedbackAgent] = {}
 
 # WebSocket endpoint for real-time video processing
 @app.websocket("/ws/video")
 async def websocket_video_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time video frame processing"""
+    """WebSocket endpoint for real-time video frame processing with AI feedback"""
     await websocket.accept()
     print("WebSocket connection established")
     
     # Generate unique session ID for this connection
     session_id = str(uuid.uuid4())
     video_recorder = None
+    feedback_agent = None
     user_id = "anonymous"  # Default value
+    
+    # Feedback collection buffers
+    frame_buffer: List[str] = []
+    audio_buffer: Optional[str] = None
+    last_feedback_time = asyncio.get_event_loop().time()
+    FEEDBACK_INTERVAL = 5.0  # seconds
     
     try:
         data_chunk_count = 0
-        feedback_messages = [
-            "Position yourself in the center",
-            "Move closer to the camera",
-            "Perfect! Hold still",
-            "Great! You're all set",
-            "Looking good!",
-            "Adjust your lighting",
-        ]
         
         while True:
             # Receive data from client
@@ -131,6 +132,11 @@ async def websocket_video_endpoint(websocket: WebSocket):
             if message_type == "auth":
                 user_id = message.get("user_id", "anonymous")
                 print(f"User authenticated: {user_id} for session {session_id}")
+                
+                # Initialize feedback agent
+                feedback_agent = FeedbackAgent()
+                active_feedback_agents[session_id] = feedback_agent
+                
                 await websocket.send_json({
                     "type": "auth_success",
                     "session_id": session_id,
@@ -143,18 +149,12 @@ async def websocket_video_endpoint(websocket: WebSocket):
                     video_recorder = VideoRecorder(session_id, user_id=user_id, fps=30)
                     active_recorders[session_id] = video_recorder
                     print(f"Started recording for session {session_id}, user {user_id}")
-
+                
+                # Video chunks are for recording only, not for AI analysis
                 data_chunk_count += 1
 
-                if data_chunk_count % 5 == 0:
-                    feedback_index = (data_chunk_count // 5) % len(feedback_messages)
-                    feedback = {
-                        "type": "feedback",
-                        "message": feedback_messages[feedback_index],
-                        "timestamp": data_chunk_count,
-                    }
-                    await websocket.send_json(feedback)
-
+                # Send status update
+                if data_chunk_count % 30 == 0:
                     status = {
                         "type": "status",
                         "segments_processed": data_chunk_count,
@@ -163,6 +163,7 @@ async def websocket_video_endpoint(websocket: WebSocket):
                     await websocket.send_json(status)
 
             elif message_type == "video_complete":
+                print(f"Received video_complete message for session {session_id}")
                 if video_recorder is None:
                     video_recorder = VideoRecorder(session_id, user_id=user_id, fps=30)
                     active_recorders[session_id] = video_recorder
@@ -170,6 +171,7 @@ async def websocket_video_endpoint(websocket: WebSocket):
 
                 complete_data = message.get("data", "")
                 if complete_data:
+                    print(f"Video data received: {len(complete_data)} characters")
                     video_recorder.set_final_webm_blob(complete_data)
                     await websocket.send_json(
                         {
@@ -178,6 +180,7 @@ async def websocket_video_endpoint(websocket: WebSocket):
                         }
                     )
                 else:
+                    print("ERROR: No video data in video_complete message")
                     await websocket.send_json(
                         {
                             "type": "upload_error",
@@ -186,32 +189,54 @@ async def websocket_video_endpoint(websocket: WebSocket):
                     )
 
             elif message_type == "frame":
-                # Initialize video recorder on first frame
+                # Initialize video recorder and feedback agent on first frame
                 if video_recorder is None:
                     video_recorder = VideoRecorder(session_id, user_id=user_id, fps=30)
                     active_recorders[session_id] = video_recorder
                     print(f"Started recording for session {session_id}, user {user_id}")
                 
+                if feedback_agent is None:
+                    feedback_agent = FeedbackAgent()
+                    active_feedback_agents[session_id] = feedback_agent
+                    print(f"Started feedback agent for session {session_id}")
+                
                 # Add frame to recorder
                 frame_data = message.get("data", "")
                 video_recorder.add_frame(frame_data)
                 
+                # Add frame to feedback buffer
+                frame_buffer.append(frame_data)
+                
                 data_chunk_count += 1
                 
-                # Here you can process the frame (base64 encoded image)
-                # For now, we'll send periodic feedback
+                # Check if it's time for AI feedback (every 5 seconds)
+                current_time = asyncio.get_event_loop().time()
+                if current_time - last_feedback_time >= FEEDBACK_INTERVAL:
+                    if frame_buffer:
+                        # Generate AI feedback in background to avoid blocking
+                        try:
+                            ai_feedback = feedback_agent.analyze_segment(
+                                frames=frame_buffer[-6:],  # Use last 6 frames (approx 0.2s at 30fps)
+                                audio_data=audio_buffer
+                            )
+                            
+                            # Send AI feedback to client
+                            await websocket.send_json({
+                                "type": "ai_feedback",
+                                "message": ai_feedback,
+                                "timestamp": data_chunk_count,
+                            })
+                            
+                            print(f"AI Feedback sent: {ai_feedback}")
+                        except Exception as e:
+                            print(f"Error generating AI feedback: {e}")
+                        
+                        # Clear buffers and reset timer
+                        frame_buffer.clear()
+                        audio_buffer = None
+                        last_feedback_time = current_time
                 
-                # Send feedback every 30 frames (roughly every second at 30fps)
-                if data_chunk_count % 30 == 0:
-                    feedback_index = (data_chunk_count // 30) % len(feedback_messages)
-                    feedback = {
-                        "type": "feedback",
-                        "message": feedback_messages[feedback_index],
-                        "timestamp": data_chunk_count
-                    }
-                    await websocket.send_json(feedback)
-                
-                # Send acknowledgment
+                # Send status acknowledgment
                 if data_chunk_count % 60 == 0:
                     status = {
                         "type": "status",
@@ -231,12 +256,16 @@ async def websocket_video_endpoint(websocket: WebSocket):
                 # Add audio chunk to recorder
                 audio_data = message.get("data", "")
                 video_recorder.add_audio_chunk(audio_data)
+                
+                # Store latest audio for feedback
+                audio_buffer = audio_data
                     
             elif message_type == "stop":
                 # Handle stop recording request
                 print(f"Stop recording request received for session {session_id}")
                 
                 if video_recorder:
+                    print(f"Video recorder exists, has_combined_blob: {video_recorder.has_combined_blob}")
                     await websocket.send_json(
                         {
                             "type": "status",
@@ -246,12 +275,15 @@ async def websocket_video_endpoint(websocket: WebSocket):
 
                     # Save video to disk
                     video_path = video_recorder.save_video()
+                    print(f"Video save result: {video_path}")
                     
                     if video_path:
+                        print(f"Uploading video to Supabase: {video_path}")
                         # Upload to Supabase
                         public_url = await upload_to_supabase(video_path, session_id, user_id)
                         
                         if public_url:
+                            print(f"Upload successful: {public_url}")
                             # Send success response with video URL
                             await websocket.send_json({
                                 "type": "upload_complete",
@@ -259,6 +291,7 @@ async def websocket_video_endpoint(websocket: WebSocket):
                                 "message": "Video uploaded successfully"
                             })
                         else:
+                            print("Upload to Supabase failed")
                             await websocket.send_json({
                                 "type": "upload_error",
                                 "message": "Failed to upload video to Supabase"
@@ -267,6 +300,7 @@ async def websocket_video_endpoint(websocket: WebSocket):
                         # Cleanup temporary file
                         video_recorder.cleanup()
                     else:
+                        print("Failed to save video - no video path returned")
                         await websocket.send_json({
                             "type": "upload_error",
                             "message": "Failed to save video"
@@ -275,6 +309,12 @@ async def websocket_video_endpoint(websocket: WebSocket):
                     # Remove from active recorders
                     if session_id in active_recorders:
                         del active_recorders[session_id]
+                else:
+                    print(f"No video recorder found for session {session_id}")
+                
+                # Cleanup feedback agent
+                if session_id in active_feedback_agents:
+                    del active_feedback_agents[session_id]
                 
                 break  # Exit the loop after handling stop
                     
@@ -288,12 +328,18 @@ async def websocket_video_endpoint(websocket: WebSocket):
         if session_id in active_recorders:
             active_recorders[session_id].cleanup()
             del active_recorders[session_id]
+        # Cleanup feedback agent
+        if session_id in active_feedback_agents:
+            del active_feedback_agents[session_id]
     except Exception as e:
         print(f"WebSocket error: {e}")
         # Cleanup recorder on error
         if session_id in active_recorders:
             active_recorders[session_id].cleanup()
             del active_recorders[session_id]
+        # Cleanup feedback agent
+        if session_id in active_feedback_agents:
+            del active_feedback_agents[session_id]
         await websocket.close()
 
 # Run the server
