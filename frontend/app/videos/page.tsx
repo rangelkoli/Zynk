@@ -2,17 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/utils/supabase/client";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 
 interface Video {
   session_id: string;
@@ -36,13 +31,12 @@ export default function VideosPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
   const [userId, setUserId] = useState<string | null>(null);
-  const [selectedVideo, setSelectedVideo] = useState<Video | null>(null);
   const supabase = createClient();
+  const router = useRouter();
 
   useEffect(() => {
     const fetchUserAndVideos = async () => {
       try {
-        // Get current user
         const {
           data: { user },
         } = await supabase.auth.getUser();
@@ -55,7 +49,6 @@ export default function VideosPage() {
 
         setUserId(user.id);
 
-        // Fetch videos from backend
         const response = await fetch(
           `http://localhost:8000/api/videos/${user.id}`
         );
@@ -63,9 +56,6 @@ export default function VideosPage() {
 
         if (data.success && data.videos) {
           setVideos(data.videos);
-          if (data.videos.length > 0) {
-            setSelectedVideo(data.videos[0]);
-          }
         } else {
           setError(data.message || "Failed to fetch videos");
         }
@@ -100,6 +90,10 @@ export default function VideosPage() {
     return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + " " + sizes[i];
   };
 
+  const handleVideoClick = (sessionId: string) => {
+    router.push(`/videos/${sessionId}`);
+  };
+
   if (loading) {
     return (
       <main className='min-h-screen bg-gray-50 dark:bg-gray-950 p-4 sm:p-6 lg:p-8'>
@@ -108,15 +102,10 @@ export default function VideosPage() {
             <Skeleton className='h-10 w-64 mb-2' />
             <Skeleton className='h-6 w-96' />
           </div>
-          <div className='grid grid-cols-1 lg:grid-cols-3 gap-6'>
-            <div className='lg:col-span-2'>
-              <Skeleton className='w-full aspect-video rounded-lg' />
-            </div>
-            <div className='space-y-4'>
-              <Skeleton className='h-32 w-full' />
-              <Skeleton className='h-32 w-full' />
-              <Skeleton className='h-32 w-full' />
-            </div>
+          <div className='grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6'>
+            <Skeleton className='h-64 w-full' />
+            <Skeleton className='h-64 w-full' />
+            <Skeleton className='h-64 w-full' />
           </div>
         </div>
       </main>
@@ -126,7 +115,6 @@ export default function VideosPage() {
   return (
     <main className='min-h-screen bg-gray-50 dark:bg-gray-950 p-4 sm:p-6 lg:p-8'>
       <div className='max-w-7xl mx-auto'>
-        {/* Header */}
         <div className='mb-8'>
           <div className='flex items-center justify-between'>
             <div>
@@ -147,14 +135,12 @@ export default function VideosPage() {
           </div>
         </div>
 
-        {/* Error State */}
         {error && (
           <Alert variant='destructive' className='mb-6'>
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         )}
 
-        {/* Empty State */}
         {!error && videos.length === 0 && (
           <Card>
             <CardContent className='flex flex-col items-center justify-center py-16'>
@@ -184,148 +170,45 @@ export default function VideosPage() {
           </Card>
         )}
 
-        {/* Videos Display */}
         {!error && videos.length > 0 && (
-          <div className='grid grid-cols-1 lg:grid-cols-3 gap-6'>
-            {/* Video Player */}
-            <div className='lg:col-span-2'>
-              <Card className='overflow-hidden shadow-lg'>
-                <CardHeader>
-                  <CardTitle>
-                    {selectedVideo
-                      ? `Session: ${selectedVideo.session_id.slice(0, 8)}...`
-                      : "Select a video"}
-                  </CardTitle>
-                  {selectedVideo && (
-                    <CardDescription>
-                      Recorded on {formatDate(selectedVideo.created_at)}
-                    </CardDescription>
-                  )}
-                </CardHeader>
+          <div className='grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6'>
+            {videos.map((video) => (
+              <Card
+                key={video.session_id}
+                className='cursor-pointer transition-all hover:shadow-lg hover:scale-105'
+                onClick={() => handleVideoClick(video.session_id)}
+              >
                 <CardContent className='p-0'>
-                  {selectedVideo ? (
-                    <div className='relative aspect-video bg-black'>
-                      <video
-                        key={selectedVideo.url}
-                        controls
-                        className='w-full h-full'
-                        src={selectedVideo.url}
+                  <div className='relative aspect-video bg-gray-200 dark:bg-gray-700 rounded-t-lg overflow-hidden'>
+                    <video
+                      src={video.url}
+                      className='w-full h-full object-cover pointer-events-none'
+                      preload='metadata'
+                      muted
+                    />
+                    <div className='absolute inset-0 bg-black bg-opacity-0 hover:bg-opacity-30 transition-all flex items-center justify-center'>
+                      <svg
+                        className='w-16 h-16 text-white opacity-0 group-hover:opacity-100 transition-opacity'
+                        fill='currentColor'
+                        viewBox='0 0 24 24'
                       >
-                        Your browser does not support the video tag.
-                      </video>
+                        <path d='M8 5v14l11-7z' />
+                      </svg>
                     </div>
-                  ) : (
-                    <div className='aspect-video bg-gray-100 dark:bg-gray-800 flex items-center justify-center'>
-                      <p className='text-gray-500'>No video selected</p>
+                  </div>
+
+                  <div className='p-4'>
+                    <h3 className='text-lg font-semibold text-gray-900 dark:text-gray-100 mb-2 truncate'>
+                      Session {video.session_id.slice(0, 8)}...
+                    </h3>
+                    <div className='space-y-1 text-sm text-gray-600 dark:text-gray-400'>
+                      <p>{formatDate(video.created_at)}</p>
+                      <p>{formatSize(video.size)}</p>
                     </div>
-                  )}
+                  </div>
                 </CardContent>
               </Card>
-
-              {/* Video Details */}
-              {selectedVideo && (
-                <Card className='mt-6'>
-                  <CardHeader>
-                    <CardTitle>Video Details</CardTitle>
-                  </CardHeader>
-                  <CardContent>
-                    <dl className='grid grid-cols-1 gap-4 sm:grid-cols-2'>
-                      <div>
-                        <dt className='text-sm font-medium text-gray-500 dark:text-gray-400'>
-                          Session ID
-                        </dt>
-                        <dd className='mt-1 text-sm text-gray-900 dark:text-gray-100 font-mono'>
-                          {selectedVideo.session_id}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className='text-sm font-medium text-gray-500 dark:text-gray-400'>
-                          File Size
-                        </dt>
-                        <dd className='mt-1 text-sm text-gray-900 dark:text-gray-100'>
-                          {formatSize(selectedVideo.size)}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className='text-sm font-medium text-gray-500 dark:text-gray-400'>
-                          Created At
-                        </dt>
-                        <dd className='mt-1 text-sm text-gray-900 dark:text-gray-100'>
-                          {formatDate(selectedVideo.created_at)}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt className='text-sm font-medium text-gray-500 dark:text-gray-400'>
-                          Updated At
-                        </dt>
-                        <dd className='mt-1 text-sm text-gray-900 dark:text-gray-100'>
-                          {formatDate(selectedVideo.updated_at)}
-                        </dd>
-                      </div>
-                    </dl>
-                    <div className='mt-6'>
-                      <a
-                        href={selectedVideo.url}
-                        download
-                        target='_blank'
-                        rel='noopener noreferrer'
-                      >
-                        <Button variant='outline' className='w-full'>
-                          Download Video
-                        </Button>
-                      </a>
-                    </div>
-                  </CardContent>
-                </Card>
-              )}
-            </div>
-
-            {/* Video List */}
-            <div className='space-y-4'>
-              <Card>
-                <CardHeader>
-                  <CardTitle>All Recordings</CardTitle>
-                  <CardDescription>Click to view a recording</CardDescription>
-                </CardHeader>
-                <CardContent className='space-y-3 max-h-[calc(100vh-200px)] overflow-y-auto'>
-                  {videos.map((video) => (
-                    <Card
-                      key={video.session_id}
-                      className={`cursor-pointer transition-all hover:shadow-md ${
-                        selectedVideo?.session_id === video.session_id
-                          ? "ring-2 ring-primary"
-                          : ""
-                      }`}
-                      onClick={() => setSelectedVideo(video)}
-                    >
-                      <CardContent className='p-4'>
-                        <div className='flex items-start space-x-3'>
-                          <div className='flex-shrink-0'>
-                            <div className='w-16 h-16 bg-gray-200 dark:bg-gray-700 rounded overflow-hidden'>
-                              <video
-                                src={video.url}
-                                className='w-full h-full object-cover'
-                              />
-                            </div>
-                          </div>
-                          <div className='flex-1 min-w-0'>
-                            <p className='text-sm font-medium text-gray-900 dark:text-gray-100 truncate'>
-                              Session {video.session_id.slice(0, 8)}
-                            </p>
-                            <p className='text-xs text-gray-500 dark:text-gray-400 mt-1'>
-                              {formatDate(video.created_at)}
-                            </p>
-                            <p className='text-xs text-gray-500 dark:text-gray-400 mt-1'>
-                              {formatSize(video.size)}
-                            </p>
-                          </div>
-                        </div>
-                      </CardContent>
-                    </Card>
-                  ))}
-                </CardContent>
-              </Card>
-            </div>
+            ))}
           </div>
         )}
       </div>

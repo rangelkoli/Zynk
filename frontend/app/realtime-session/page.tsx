@@ -11,6 +11,22 @@ import {
 } from "@/components/ui/card";
 import { createClient } from "@/utils/supabase/client";
 
+type FeedbackSegment = {
+  id: string;
+  feedbackText: string;
+  startSeconds: number;
+  endSeconds: number;
+  createdAt: string;
+};
+
+const formatTime = (totalSeconds: number) => {
+  if (!Number.isFinite(totalSeconds)) return "0:00";
+  const rounded = Math.max(0, totalSeconds);
+  const minutes = Math.floor(rounded / 60);
+  const seconds = Math.floor(rounded % 60);
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+};
+
 export default function WebcamPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -25,6 +41,10 @@ export default function WebcamPage() {
   );
   const [isAIFeedback, setIsAIFeedback] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [feedbackSegments, setFeedbackSegments] = useState<FeedbackSegment[]>(
+    []
+  );
   const supabase = createClient();
 
   // Fetch user ID on component mount
@@ -88,13 +108,60 @@ export default function WebcamPage() {
 
       if (data.type === "auth_success") {
         console.log("Authentication successful:", data.session_id);
+        setSessionId(data.session_id);
       } else if (data.type === "ai_feedback") {
         // Handle AI feedback from the feedback agent
         console.log("AI Feedback received:", data.message);
-        if (data.message !== "OK") {
+        const isActionable =
+          data.is_actionable ?? (data.message && data.message !== "OK");
+
+        if (isActionable && data.message) {
+          const startValue = Number.parseFloat(
+            data.start_seconds ?? data.startSeconds ?? 0
+          );
+          const endValue = Number.parseFloat(
+            data.end_seconds ?? data.endSeconds ?? startValue
+          );
+          const startSeconds = Number.isFinite(startValue) ? startValue : 0;
+          const endSeconds = Number.isFinite(endValue)
+            ? Math.max(endValue, startSeconds)
+            : startSeconds;
+          const createdAt =
+            (data.created_at as string | undefined) ?? new Date().toISOString();
+
+          const rangeLabel = `${formatTime(startSeconds)} - ${formatTime(
+            endSeconds
+          )}`;
+
+          setFeedbackSegments((prev) => {
+            const index =
+              (data.segment_index as number | undefined) ?? prev.length;
+            const segmentId = `${
+              (data.session_id as string | undefined) ?? sessionId ?? "session"
+            }-${index}`;
+
+            if (prev.some((segment) => segment.id === segmentId)) {
+              return prev;
+            }
+
+            return [
+              ...prev,
+              {
+                id: segmentId,
+                feedbackText: data.message as string,
+                startSeconds,
+                endSeconds,
+                createdAt,
+              },
+            ];
+          });
+
+          setFeedbackText(`${rangeLabel} - ${data.message}`);
+          setIsAIFeedback(true);
+          setTimeout(() => setIsAIFeedback(false), 4000);
+        } else if (data.message && data.message !== "OK") {
           setFeedbackText(data.message);
           setIsAIFeedback(true);
-          // Clear AI feedback flag after 4 seconds
           setTimeout(() => setIsAIFeedback(false), 4000);
         }
       } else if (data.type === "feedback") {
@@ -113,6 +180,23 @@ export default function WebcamPage() {
         setFeedbackText(`Video uploaded successfully! URL: ${data.url}`);
         setIsAIFeedback(false);
         console.log("Video URL:", data.url);
+      } else if (data.type === "feedback_saved") {
+        const savedCount = data.segments_saved ?? data.count ?? 0;
+        setFeedbackText(
+          savedCount
+            ? `Saved ${savedCount} feedback note${savedCount === 1 ? "" : "s"}`
+            : "No actionable feedback to save"
+        );
+        setIsAIFeedback(false);
+        console.log("Feedback segments saved:", savedCount);
+        ws.close();
+        wsRef.current = null;
+      } else if (data.type === "feedback_save_error") {
+        const message = data.message ?? "Failed to save feedback";
+        setFeedbackText(`Error saving feedback: ${message}`);
+        setIsAIFeedback(false);
+        setError(message);
+        console.error("Feedback save error:", message);
         ws.close();
         wsRef.current = null;
       } else if (data.type === "upload_error") {
@@ -133,6 +217,7 @@ export default function WebcamPage() {
     ws.onclose = () => {
       console.log("WebSocket disconnected");
       setIsConnected(false);
+      setSessionId(null);
       wsRef.current = null;
     };
 
@@ -280,6 +365,9 @@ export default function WebcamPage() {
         return;
       }
 
+      setFeedbackSegments([]);
+      setSessionId(null);
+
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 1280, height: 720 },
         audio: true,
@@ -310,6 +398,7 @@ export default function WebcamPage() {
       videoRef.current.srcObject = null;
       setIsStreaming(false);
       setFeedbackText("Processing and uploading video...");
+      setIsAIFeedback(false);
 
       if (frameIntervalRef.current) {
         clearInterval(frameIntervalRef.current);
@@ -432,6 +521,37 @@ export default function WebcamPage() {
                   <div className='bg-destructive/10 text-destructive px-3 py-2 rounded-md text-sm font-medium'>
                     <p>{error}</p>
                   </div>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card className='shadow-lg'>
+              <CardHeader>
+                <CardTitle>AI Feedback Timeline</CardTitle>
+                <CardDescription>
+                  Timestamped notes captured throughout your session
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                {feedbackSegments.length ? (
+                  <div className='space-y-3 max-h-64 overflow-y-auto pr-1'>
+                    {feedbackSegments.map((segment) => (
+                      <div
+                        key={segment.id}
+                        className='rounded-md border border-border/50 bg-muted/30 p-3'
+                      >
+                        <p className='text-sm text-foreground font-medium'>
+                          {formatTime(segment.startSeconds)} -{" "}
+                          {formatTime(segment.endSeconds)} -{" "}
+                          {segment.feedbackText}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className='text-sm text-muted-foreground'>
+                    AI feedback will appear here once you start presenting.
+                  </p>
                 )}
               </CardContent>
             </Card>

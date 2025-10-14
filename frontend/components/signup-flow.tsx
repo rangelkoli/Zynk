@@ -31,9 +31,9 @@ export function SignupForm({
               <div className='flex size-8 items-center justify-center rounded-md'>
                 <GalleryVerticalEnd className='size-6' />
               </div>
-              <span className='sr-only'>Zynk</span>
+              <span className='sr-only'>SpeakFlow</span>
             </Link>
-            <h1 className='text-xl font-bold'>Welcome to Zynk</h1>
+            <h1 className='text-xl font-bold'>Welcome to SpeakFlow</h1>
             <FieldDescription>
               Already have an account? <Link href='/login'>Sign in</Link>
             </FieldDescription>

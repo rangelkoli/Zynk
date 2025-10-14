@@ -9,14 +9,18 @@ import base64
 from typing import List, Optional
 from PIL import Image
 import io
+
 from .feedback_utils import analyze_audio_tone_fast, compress_images_for_gemini
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types  # google-genai package
     GENAI_AVAILABLE = True
 except ImportError:
+    genai = None
+    types = None
     GENAI_AVAILABLE = False
-    print("Warning: google-generativeai not installed. AI feedback will be disabled.")
+    print("Warning: google-genai not installed. AI feedback will be disabled.")
 
 
 SYSTEM_PROMPT = (
@@ -46,14 +50,15 @@ class FeedbackAgent:
         """
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
         self.chat_history: List[str] = []
-        self.model = None
-        
-        if GENAI_AVAILABLE and self.api_key:
-            genai.configure(api_key=self.api_key)
-            self.model = genai.GenerativeModel(
-                'gemini-2.5-flash-lite', 
-                system_instruction=SYSTEM_PROMPT
-            )
+        self.client = None
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
+        if GENAI_AVAILABLE and types and self.api_key:
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+            except Exception as exc:  # pylint: disable=broad-except
+                self.client = None
+                print(f"Failed to initialize Gemini client: {exc}")
         else:
             print("Warning: Gemini AI not configured. Feedback will be placeholder.")
     
@@ -72,7 +77,7 @@ class FeedbackAgent:
         Returns:
             Feedback string
         """
-        if not self.model:
+        if not self.client or not types:
             return "AI feedback unavailable (API not configured)"
         
         try:
@@ -136,14 +141,42 @@ class FeedbackAgent:
                 except Exception as e:
                     tone_report = f"Audio analysis failed: {str(e)[:50]}"
             
-            # Build prompt
-            prompt = ""
+            # Build prompt including system guidance and context
+            prompt = SYSTEM_PROMPT
             if self.chat_history:
                 prompt += "\n\nPrevious feedbacks:\n" + "\n".join(self.chat_history[-3:])  # Only last 3 for context
             prompt += f"\n\nSpeaker voice/tone: {tone_report}"
             
             # Get feedback from Gemini
-            response = self.model.generate_content([prompt] + images, stream=False)
+            parts = [{"text": prompt}]
+            for img in images:
+                buffered = io.BytesIO()
+                # Default to JPEG to keep size manageable
+                img_format = (img.format or "JPEG").upper()
+                mime_type = "image/jpeg" if img_format == "JPEG" else f"image/{img_format.lower()}"
+                try:
+                    img.save(buffered, format=img_format)
+                except ValueError:
+                    # Fallback to JPEG if the specific format isn't supported for saving
+                    buffered = io.BytesIO()
+                    img.save(buffered, format="JPEG")
+                    mime_type = "image/jpeg"
+
+                image_bytes = buffered.getvalue()
+                image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+                parts.append({
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": image_b64,
+                    }
+                })
+
+            contents = [{"role": "user", "parts": parts}]
+
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+            )
             feedback = response.candidates[0].content.parts[0].text.strip()
             
             # Store non-OK feedback in history

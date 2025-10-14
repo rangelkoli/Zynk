@@ -1,15 +1,21 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
+from datetime import datetime
 import json
 import base64
 import asyncio
 import uuid
-from video_recorder import VideoRecorder, upload_to_supabase, get_user_videos
+from video_recorder import (
+    VideoRecorder,
+    upload_to_supabase,
+    get_user_videos,
+    save_feedback_segments_to_supabase,
+)
 from feedback_agent import FeedbackAgent
 
-app = FastAPI(title="Zynk API", version="1.0.0")
+app = FastAPI(title="SpeakFlow API", version="1.0.0")
 
 # Configure CORS
 app.add_middleware(
@@ -96,6 +102,50 @@ async def get_videos(user_id: str):
             "videos": []
         }
 
+@app.get("/api/feedback/{session_id}")
+async def get_feedback(session_id: str):
+    """Get AI feedback segments for a specific session"""
+    try:
+        from supabase import create_client
+        import os
+        from dotenv import load_dotenv
+        
+        load_dotenv()
+        supabase_url = os.getenv("SUPABASE_URL")
+        supabase_key = os.getenv("SUPABASE_KEY")
+        
+        if not supabase_url or not supabase_key:
+            return {
+                "success": False,
+                "message": "Supabase configuration not found",
+                "feedback": []
+            }
+        
+        supabase = create_client(supabase_url, supabase_key)
+        
+        # Query feedback segments for the session
+        response = supabase.table("ai_feedback_segments")\
+            .select("*")\
+            .eq("session_id", session_id)\
+            .order("start_seconds", desc=False)\
+            .execute()
+        
+        feedback_segments = response.data if response.data else []
+        
+        return {
+            "success": True,
+            "session_id": session_id,
+            "count": len(feedback_segments),
+            "feedback": feedback_segments
+        }
+    except Exception as e:
+        print(f"Error in get_feedback endpoint: {e}")
+        return {
+            "success": False,
+            "message": str(e),
+            "feedback": []
+        }
+
 # Store active video recorders and feedback agents
 active_recorders: Dict[str, VideoRecorder] = {}
 active_feedback_agents: Dict[str, FeedbackAgent] = {}
@@ -116,7 +166,9 @@ async def websocket_video_endpoint(websocket: WebSocket):
     # Feedback collection buffers
     frame_buffer: List[str] = []
     audio_buffer: Optional[str] = None
-    last_feedback_time = asyncio.get_event_loop().time()
+    session_start_time = asyncio.get_event_loop().time()
+    last_feedback_time = session_start_time
+    feedback_segments: List[Dict[str, Any]] = []
     FEEDBACK_INTERVAL = 5.0  # seconds
     
     try:
@@ -220,14 +272,53 @@ async def websocket_video_endpoint(websocket: WebSocket):
                                 audio_data=audio_buffer
                             )
                             
-                            # Send AI feedback to client
-                            await websocket.send_json({
+                            current_offset = current_time - session_start_time
+                            segment_start = max(0.0, last_feedback_time - session_start_time)
+                            segment_end = max(segment_start, current_offset)
+                            created_at = datetime.utcnow().isoformat() + "Z"
+
+                            feedback_text = (ai_feedback or "").strip()
+                            is_actionable = (
+                                bool(feedback_text)
+                                and feedback_text.upper() != "OK"
+                                and not feedback_text.lower().startswith("error")
+                            )
+
+                            payload: Dict[str, Any] = {
                                 "type": "ai_feedback",
                                 "message": ai_feedback,
-                                "timestamp": data_chunk_count,
-                            })
-                            
-                            print(f"AI Feedback sent: {ai_feedback}")
+                                "timestamp": round(segment_end, 2),
+                                "session_id": session_id,
+                                "is_actionable": is_actionable,
+                            }
+
+                            if is_actionable:
+                                segment_entry = {
+                                    "feedback_text": feedback_text,
+                                    "start_seconds": round(segment_start, 2),
+                                    "end_seconds": round(segment_end, 2),
+                                    "created_at": created_at,
+                                }
+                                feedback_segments.append(segment_entry)
+                                payload.update(
+                                    {
+                                        "start_seconds": segment_entry["start_seconds"],
+                                        "end_seconds": segment_entry["end_seconds"],
+                                        "created_at": created_at,
+                                        "segment_index": len(feedback_segments) - 1,
+                                    }
+                                )
+
+                            # Send AI feedback to client
+                            await websocket.send_json(payload)
+
+                            if is_actionable:
+                                print(
+                                    "AI Feedback sent:",
+                                    f"{feedback_text} ({payload['start_seconds']}s-{payload['end_seconds']}s)",
+                                )
+                            else:
+                                print(f"AI Feedback (non-actionable): {ai_feedback}")
                         except Exception as e:
                             print(f"Error generating AI feedback: {e}")
                         
@@ -288,13 +379,15 @@ async def websocket_video_endpoint(websocket: WebSocket):
                             await websocket.send_json({
                                 "type": "upload_complete",
                                 "url": public_url,
-                                "message": "Video uploaded successfully"
+                                "message": "Video uploaded successfully",
+                                "session_id": session_id,
                             })
                         else:
                             print("Upload to Supabase failed")
                             await websocket.send_json({
                                 "type": "upload_error",
-                                "message": "Failed to upload video to Supabase"
+                                "message": "Failed to upload video to Supabase",
+                                "session_id": session_id,
                             })
                         
                         # Cleanup temporary file
@@ -312,6 +405,51 @@ async def websocket_video_endpoint(websocket: WebSocket):
                 else:
                     print(f"No video recorder found for session {session_id}")
                 
+                # Persist AI feedback segments to Supabase
+                try:
+                    save_result = await save_feedback_segments_to_supabase(
+                        session_id=session_id,
+                        user_id=user_id,
+                        segments=feedback_segments,
+                    )
+
+                    if save_result.get("success"):
+                        await websocket.send_json(
+                            {
+                                "type": "feedback_saved",
+                                "session_id": session_id,
+                                "segments_saved": save_result.get("count", 0),
+                            }
+                        )
+                        print(
+                            f"Saved {save_result.get('count', 0)} feedback segments for session {session_id}"
+                        )
+                    else:
+                        await websocket.send_json(
+                            {
+                                "type": "feedback_save_error",
+                                "session_id": session_id,
+                                "message": save_result.get(
+                                    "error", "Failed to save feedback segments"
+                                ),
+                            }
+                        )
+                        print(
+                            f"Failed to save feedback segments for session {session_id}: {save_result.get('error')}"
+                        )
+                except Exception as e:
+                    error_text = str(e)
+                    await websocket.send_json(
+                        {
+                            "type": "feedback_save_error",
+                            "session_id": session_id,
+                            "message": error_text,
+                        }
+                    )
+                    print(f"Exception while saving feedback segments: {error_text}")
+
+                feedback_segments.clear()
+
                 # Cleanup feedback agent
                 if session_id in active_feedback_agents:
                     del active_feedback_agents[session_id]

@@ -1,11 +1,12 @@
 import os
+import asyncio
 import cv2
 import numpy as np
 from PIL import Image
 import base64
 from io import BytesIO
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from supabase import create_client, Client
 from dotenv import load_dotenv
 import subprocess
@@ -404,3 +405,61 @@ async def get_user_videos(user_id: str) -> Optional[List[dict]]:
     except Exception as e:
         print(f"Error retrieving videos for user {user_id}: {e}")
         return None
+
+
+async def save_feedback_segments_to_supabase(
+    session_id: str,
+    user_id: str,
+    segments: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Persist AI feedback segments to Supabase database.
+
+    Args:
+        session_id: Unique session identifier
+        user_id: Authenticated user identifier
+        segments: List of segment dictionaries containing feedback_text and timing
+
+    Returns:
+        Dictionary with success flag, count saved, and optional error message
+    """
+
+    if not segments:
+        return {"success": True, "count": 0}
+
+    if not supabase:
+        error_msg = "Supabase client not initialized"
+        print(error_msg)
+        return {"success": False, "count": 0, "error": error_msg}
+
+    rows = []
+    for segment in segments:
+        feedback_text = segment.get("feedback_text")
+        if not feedback_text:
+            continue
+
+        rows.append(
+            {
+                "session_id": session_id,
+                "user_id": user_id,
+                "feedback_text": feedback_text,
+                "start_seconds": round(float(segment.get("start_seconds", 0.0)), 2),
+                "end_seconds": round(float(segment.get("end_seconds", 0.0)), 2),
+            }
+        )
+
+    if not rows:
+        return {"success": True, "count": 0}
+
+    def insert_rows():
+        try:
+            response = supabase.table("ai_feedback_segments").insert(rows).execute()
+            data = getattr(response, "data", None)
+            saved_count = len(data) if data else len(rows)
+            return {"success": True, "count": saved_count, "data": data}
+        except Exception as exc:
+            error_text = str(exc)
+            print(f"Error saving feedback segments: {error_text}")
+            return {"success": False, "count": 0, "error": error_text}
+
+    return await asyncio.to_thread(insert_rows)
